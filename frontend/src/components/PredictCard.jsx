@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import axios from 'axios'
 
 const TEAM_COLORS = {
   KIA: '#EA0029', LG: '#C30452', SSG: '#CE0E2D', KT: '#888',
@@ -124,6 +125,8 @@ function TeamPanel({ team, winProb, recentStats, pitcher, pitcherStats, isWinner
 
 export default function PredictCard({ prediction, showDetail = false }) {
   const [expanded, setExpanded] = useState(showDetail)
+  const [explainLoading, setExplainLoading] = useState(false)
+  const [aiExplanation, setAiExplanation] = useState(null)
 
   const {
     home_team, away_team,
@@ -134,10 +137,25 @@ export default function PredictCard({ prediction, showDetail = false }) {
     game_time, prediction_method,
     status, home_score, away_score, actual_winner, date,
     home_pitcher_stats, away_pitcher_stats, pitcher_adjustment,
-    standings_adjustment, standings_context,
+    standings_adjustment, standings_context, data_quality, explanation, run_expectancy,
   } = prediction
 
   const conf = CONFIDENCE_CONFIG[confidence] || CONFIDENCE_CONFIG['낮음']
+
+  const loadAiExplanation = async () => {
+    setExplainLoading(true)
+    try {
+      const res = await axios.post('/api/explain/prediction', { prediction })
+      setAiExplanation(res.data)
+    } catch (e) {
+      setAiExplanation({
+        source: 'error',
+        explanation: 'AI 설명을 가져오지 못했습니다. Ollama 실행 상태를 확인해주세요.',
+      })
+    } finally {
+      setExplainLoading(false)
+    }
+  }
 
   return (
     <div className="card animate-fade-in" style={{ padding: 0, overflow: 'hidden' }}>
@@ -261,6 +279,61 @@ export default function PredictCard({ prediction, showDetail = false }) {
                 {' '}· {home_team} {standings_context.home_rank}위 / {away_team} {standings_context.away_rank}위
               </span>
             )}
+          </div>
+        )}
+
+        {data_quality && (
+          <div style={{
+            marginTop: 8, fontSize: 12, color: '#9090b0',
+            padding: '8px 12px', borderRadius: 8,
+            background: 'rgba(255,255,255,0.04)',
+            border: '1px solid rgba(255,255,255,0.06)',
+          }}>
+            데이터 품질: {data_quality.label} ({Math.round(data_quality.score * 100)}%)
+            {explanation && (
+              <span>
+                {' '}· 기본 {(explanation.base_model_prob * 100).toFixed(1)}%
+                {' '}→ 최종 {(explanation.final_home_win_prob * 100).toFixed(1)}%
+              </span>
+            )}
+          </div>
+        )}
+
+        {run_expectancy && (
+          <div style={{
+            marginTop: 8, fontSize: 12, color: '#9090b0',
+            padding: '8px 12px', borderRadius: 8,
+            background: 'rgba(255,255,255,0.04)',
+            border: '1px solid rgba(255,255,255,0.06)',
+          }}>
+            예상 득점: {away_team} {run_expectancy.away_expected_runs}
+            {' '}· {home_team} {run_expectancy.home_expected_runs}
+          </div>
+        )}
+
+        <div style={{ marginTop: 10 }}>
+          <button
+            type="button"
+            onClick={loadAiExplanation}
+            disabled={explainLoading}
+            className="btn btn-ghost"
+            style={{ fontSize: 12, padding: '7px 12px' }}
+          >
+            {explainLoading ? 'AI 설명 생성 중...' : 'Ollama AI 설명 보기'}
+          </button>
+        </div>
+
+        {aiExplanation?.explanation && (
+          <div style={{
+            marginTop: 10, fontSize: 13, lineHeight: 1.6, color: '#c7c7e8',
+            padding: '12px 14px', borderRadius: 10,
+            background: 'rgba(129,140,248,0.08)',
+            border: '1px solid rgba(129,140,248,0.18)',
+          }}>
+            <div style={{ fontSize: 11, color: '#818cf8', fontWeight: 700, marginBottom: 6 }}>
+              설명가능한 AI · {aiExplanation.source === 'ollama' ? aiExplanation.model : '기본 설명'}
+            </div>
+            {aiExplanation.explanation}
           </div>
         )}
 

@@ -1,0 +1,16 @@
+services:
+  kbo-web:
+    build: .
+    container_name: kbo-predictor
+    ports:
+      - "8000:8000"
+    environment:
+      KBO_API_HOST: 0.0.0.0
+      KBO_API_PORT: 8000
+      KBO_RELOAD: "false"
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    volumes:
+      - ./data:/app/data
+      - ./model/saved:/app/model/saved
+      - ./logs:/app/logs
+    restart: unless-stopped

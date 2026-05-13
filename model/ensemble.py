@@ -6,7 +6,7 @@ import logging
 import numpy as np
 import joblib
 from pathlib import Path
-from sklearn.metrics import accuracy_score, roc_auc_score, log_loss
+from sklearn.metrics import accuracy_score, brier_score_loss, roc_auc_score, log_loss
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -27,6 +27,7 @@ class KBOEnsemble:
         self.neural_scaler = None
         self.feature_cols = None
         self.calibrator = None
+        self.stacker = None
         self._loaded = False
 
     def load(self):
@@ -44,6 +45,12 @@ class KBOEnsemble:
             logger.info("신경망 모델 로드 완료")
         except Exception as e:
             logger.warning(f"신경망 로드 실패: {e}")
+
+        try:
+            self.stacker = load_stacking_model()
+            logger.info("스태킹 메타 모델 로드 완료")
+        except Exception:
+            self.stacker = None
 
         try:
             self.calibrator = load_probability_calibrator()
@@ -91,13 +98,23 @@ class KBOEnsemble:
             logger.error("모든 모델 예측 실패 - 0.5 반환")
             return np.full(X.shape[0], 0.5)
 
-        # 가중 평균
-        total_weight = sum(used_weights)
-        weights_norm = [w / total_weight for w in used_weights]
+        if self.stacker is not None and len(probs) == 3:
+            try:
+                ensemble_prob = self.stacker.predict_proba(np.stack(probs, axis=1))[:, 1]
+            except Exception as e:
+                logger.warning(f"스태킹 예측 실패, 가중 평균으로 폴백: {e}")
+                ensemble_prob = None
+        else:
+            ensemble_prob = None
 
-        ensemble_prob = np.zeros(X.shape[0])
-        for p, w in zip(probs, weights_norm):
-            ensemble_prob += p * w
+        if ensemble_prob is None:
+            # 가중 평균
+            total_weight = sum(used_weights)
+            weights_norm = [w / total_weight for w in used_weights]
+
+            ensemble_prob = np.zeros(X.shape[0])
+            for p, w in zip(probs, weights_norm):
+                ensemble_prob += p * w
 
         if self.calibrator is not None:
             try:
@@ -164,17 +181,19 @@ def optimize_weights(
 
     stacked = np.stack([probs_xgb, probs_lgb, probs_nn], axis=1)
 
-    def neg_auc(weights):
+    def objective(weights):
         w = np.array(weights)
         w = w / w.sum()
         ensemble = (stacked * w).sum(axis=1)
-        return -roc_auc_score(y_val, ensemble)
+        clipped = np.clip(ensemble, 1e-5, 1 - 1e-5)
+        # 실제 운영 확률은 AUC보다 logloss/Brier가 중요하다.
+        return log_loss(y_val, clipped) + 0.35 * brier_score_loss(y_val, clipped)
 
     x0 = [0.4, 0.35, 0.25]
     constraints = [{"type": "eq", "fun": lambda w: sum(w) - 1}]
     bounds = [(0.05, 0.9)] * 3
 
-    result = minimize(neg_auc, x0, method="SLSQP",
+    result = minimize(objective, x0, method="SLSQP",
                       bounds=bounds, constraints=constraints)
 
     opt_weights = result.x / result.x.sum()
@@ -195,11 +214,30 @@ def load_ensemble_config() -> dict:
     return {"xgb": 0.4, "lgb": 0.35, "neural": 0.25}
 
 
+def fit_stacking_model(probs_xgb: np.ndarray, probs_lgb: np.ndarray, probs_nn: np.ndarray, y_val: np.ndarray):
+    """개별 모델 예측값을 입력으로 받는 메타 로지스틱 모델."""
+    from sklearn.linear_model import LogisticRegression
+
+    X_meta = np.stack([probs_xgb, probs_lgb, probs_nn], axis=1)
+    stacker = LogisticRegression(C=0.5, solver="lbfgs")
+    stacker.fit(X_meta, y_val)
+    return stacker
+
+
+def save_stacking_model(stacker):
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(stacker, MODEL_DIR / "stacking_model.pkl")
+
+
+def load_stacking_model():
+    return joblib.load(MODEL_DIR / "stacking_model.pkl")
+
+
 def fit_probability_calibrator(raw_probs: np.ndarray, y_val: np.ndarray):
     """검증 세트로 앙상블 확률을 Platt scaling 보정."""
     from sklearn.linear_model import LogisticRegression
 
-    calibrator = LogisticRegression(C=1.0, solver="lbfgs")
+    calibrator = LogisticRegression(C=0.35, solver="lbfgs")
     calibrator.fit(raw_probs.reshape(-1, 1), y_val)
     return calibrator
 

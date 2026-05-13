@@ -12,6 +12,7 @@ from datetime import timedelta
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import RAW_DIR, PROCESSED_DIR, ROLLING_WINDOWS
+from enrichment import build_game_context_features
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -209,6 +210,42 @@ def compute_h2h_stats(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def compute_elo_features(df: pd.DataFrame) -> dict[int, dict]:
+    """경기 직전 Elo 레이팅/기대승률 피처."""
+    ratings: dict[str, float] = {}
+    elo_rows: dict[int, dict] = {}
+    base_rating = 1500.0
+    k_factor = 18.0
+    home_advantage = 35.0
+
+    teams = pd.concat([df["home_team"], df["away_team"]]).dropna().unique()
+    for team in teams:
+        ratings[team] = base_rating
+
+    for idx, row in df.sort_values("date").iterrows():
+        home = row["home_team"]
+        away = row["away_team"]
+        home_rating = ratings.get(home, base_rating)
+        away_rating = ratings.get(away, base_rating)
+        expected_home = 1 / (1 + 10 ** ((away_rating - (home_rating + home_advantage)) / 400))
+
+        elo_rows[idx] = {
+            "home_elo": home_rating,
+            "away_elo": away_rating,
+            "diff_elo": home_rating - away_rating,
+            "elo_home_win_prob": expected_home,
+        }
+
+        actual = float(row["home_win"])
+        margin = abs(float(row["home_score"]) - float(row["away_score"]))
+        margin_multiplier = np.log(max(margin, 1.0) + 1.0) * 0.75 + 1.0
+        delta = k_factor * margin_multiplier * (actual - expected_home)
+        ratings[home] = home_rating + delta
+        ratings[away] = away_rating - delta
+
+    return elo_rows
+
+
 def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     """최종 피처 매트릭스 생성"""
     logger.info("팀별 이동 통계 계산 중...")
@@ -219,6 +256,12 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
 
     logger.info("구장 런팩터 계산 중...")
     stadium_factors = compute_stadium_run_factors(df)
+
+    logger.info("Elo 레이팅 피처 계산 중...")
+    elo_features = compute_elo_features(df)
+
+    logger.info("선발투수/라인업/날씨 컨텍스트 피처 계산 중...")
+    context_features = build_game_context_features(df)
 
     feature_rows = []
 
@@ -248,6 +291,8 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
             "home_team": home,
             "away_team": away,
             "home_win": row["home_win"],
+            "home_score": row.get("home_score", 0),
+            "away_score": row.get("away_score", 0),
             "season": row["date"].year,
         }
 
@@ -300,8 +345,18 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
         # 시즌 내 위치 (0~1)
         feat["season_progress"] = (game_date.timetuple().tm_yday - 60) / 240
 
+        feat.update(elo_features.get(idx, {
+            "home_elo": 1500.0,
+            "away_elo": 1500.0,
+            "diff_elo": 0.0,
+            "elo_home_win_prob": 0.5,
+        }))
+
         stadium = row.get("stadium", "")
         feat["stadium_run_factor"] = stadium_factors.get((game_date, stadium), 1.0)
+
+        if idx in context_features.index:
+            feat.update(context_features.loc[idx].to_dict())
 
         feature_rows.append(feat)
 
@@ -318,7 +373,8 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
 def get_feature_columns(df: pd.DataFrame) -> list[str]:
     """모델 입력 피처 컬럼 목록"""
     exclude = {"date", "home_team", "away_team", "home_win", "season",
-               "home_pitcher", "away_pitcher", "stadium", "game_id", "preview_url", "status"}
+               "home_score", "away_score", "home_pitcher", "away_pitcher",
+               "stadium", "game_id", "preview_url", "status"}
     return [c for c in df.columns if c not in exclude]
 
 

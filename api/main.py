@@ -43,6 +43,7 @@ if FRONTEND_BUILD.exists():
 
 # ===== 전역 모델/데이터 =====
 ensemble = None
+run_expectancy_model = None
 feature_cols = None
 features_df = None
 games_df = None
@@ -88,7 +89,7 @@ def get_live_standings(force: bool = False) -> list[dict]:
 
 
 def load_models_and_data():
-    global ensemble, feature_cols, features_df, games_df
+    global ensemble, run_expectancy_model, feature_cols, features_df, games_df
 
     # 앙상블 모델 로드
     try:
@@ -100,6 +101,15 @@ def load_models_and_data():
         logger.info("앙상블 모델 로드 완료")
     except Exception as e:
         logger.warning(f"모델 로드 실패: {e}")
+
+    try:
+        sys.path.insert(0, str(Path(__file__).parent.parent / "model"))
+        from run_expectancy import load_run_expectancy_model
+        run_expectancy_model = load_run_expectancy_model()
+        logger.info("예상 득점 모델 로드 완료")
+    except Exception as e:
+        run_expectancy_model = None
+        logger.warning(f"예상 득점 모델 로드 실패: {e}")
 
     # 피처 데이터 로드
     try:
@@ -138,6 +148,11 @@ class PredictRequest(BaseModel):
     away_pitcher: Optional[str] = None
     home_pitcher_stats: Optional[dict] = None
     away_pitcher_stats: Optional[dict] = None
+
+
+class ExplainRequest(BaseModel):
+    prediction: dict
+    model: Optional[str] = None
 
 
 class TeamStatsRequest(BaseModel):
@@ -382,6 +397,263 @@ def apply_standings_adjustment(prob: float, home_team: str, away_team: str) -> t
     return adjusted, adjustment, context
 
 
+def build_prediction_quality(
+    prediction_method: str,
+    home_stats: dict,
+    away_stats: dict,
+    home_pitcher_stats: dict | None,
+    away_pitcher_stats: dict | None,
+    standings_context: dict,
+) -> dict:
+    """예측에 사용된 데이터의 품질/완성도를 점수화."""
+    score = 0.0
+    warnings = []
+
+    if prediction_method.startswith("AI 앙상블"):
+        score += 0.30
+    else:
+        warnings.append("모델 피처가 부족해 통계 기반 예측을 사용했습니다.")
+
+    if home_stats and away_stats:
+        min_games = min(home_stats.get("total", 0), away_stats.get("total", 0))
+        score += min(0.20, min_games / 20 * 0.20)
+    else:
+        warnings.append("최근 팀 성적 데이터가 부족합니다.")
+
+    if home_pitcher_stats and away_pitcher_stats:
+        score += 0.25
+    else:
+        warnings.append("선발투수 전력분석 데이터가 없거나 아직 발표되지 않았습니다.")
+
+    if standings_context.get("source") == "kbo_official":
+        score += 0.20
+    elif standings_context:
+        score += 0.10
+        warnings.append("순위 데이터가 공식 실시간 소스가 아닐 수 있습니다.")
+    else:
+        warnings.append("최신 순위 보정 데이터를 사용하지 못했습니다.")
+
+    score += 0.05  # 기본 홈/원정, 날짜 컨텍스트
+    score = max(0.0, min(1.0, score))
+
+    if score >= 0.80:
+        label = "높음"
+    elif score >= 0.55:
+        label = "보통"
+    else:
+        label = "낮음"
+
+    return {
+        "score": round(score, 2),
+        "label": label,
+        "warnings": warnings,
+    }
+
+
+def _ollama_base_url() -> str:
+    import os
+    return os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+
+
+def get_ollama_models() -> list[str]:
+    try:
+        import requests
+        resp = requests.get(f"{_ollama_base_url()}/api/tags", timeout=2)
+        resp.raise_for_status()
+        return [m.get("name") for m in resp.json().get("models", []) if m.get("name")]
+    except Exception:
+        return []
+
+
+def choose_ollama_model(requested: str | None = None) -> str | None:
+    models = get_ollama_models()
+    if requested and requested in models:
+        return requested
+    if requested and models:
+        for model in models:
+            if requested.lower() in model.lower():
+                return model
+    preferred = ("qwen3", "qwen2.5", "deepseek", "exaone", "llama", "gemma", "mistral")
+    for key in preferred:
+        match = next((model for model in models if key in model.lower()), None)
+        if match:
+            return match
+    return models[0] if models else None
+
+
+def fallback_prediction_explanation(prediction: dict) -> str:
+    home = prediction.get("home_team", "홈팀")
+    away = prediction.get("away_team", "원정팀")
+    winner = prediction.get("predicted_winner", "")
+    home_prob = float(prediction.get("home_win_prob") or 0.5)
+    base = float(prediction.get("base_model_prob") or home_prob)
+    pitcher_adj = float(prediction.get("pitcher_adjustment") or 0.0)
+    standings_adj = float(prediction.get("standings_adjustment") or 0.0)
+    quality = prediction.get("data_quality", {})
+
+    pitcher_text = "선발투수 데이터가 충분하지 않아 투수 보정은 제한적입니다."
+    if abs(pitcher_adj) >= 0.005:
+        pitcher_text = f"선발투수 보정은 홈팀 기준 {pitcher_adj * 100:+.1f}%p로 반영됐습니다."
+
+    standings_text = "최신 순위 보정은 크지 않습니다."
+    if abs(standings_adj) >= 0.005:
+        standings_text = f"최신 순위/최근 성적 보정은 홈팀 기준 {standings_adj * 100:+.1f}%p입니다."
+
+    return (
+        f"{away} vs {home} 경기의 기본 홈 승률은 {base * 100:.1f}%였고, "
+        f"선발투수와 최신 순위 보정을 거친 최종 홈 승률은 {home_prob * 100:.1f}%입니다. "
+        f"현재 예측 승리팀은 {winner}입니다. {pitcher_text} {standings_text} "
+        f"데이터 품질은 {quality.get('label', '보통')} 수준으로 평가됩니다. "
+        "이 예측은 참고용이며, 당일 라인업 변경과 경기 직전 변수에 따라 달라질 수 있습니다."
+    )
+
+
+def build_llm_prompt(prediction: dict) -> str:
+    compact = {
+        "home_team": prediction.get("home_team"),
+        "away_team": prediction.get("away_team"),
+        "home_win_prob": prediction.get("home_win_prob"),
+        "away_win_prob": prediction.get("away_win_prob"),
+        "predicted_winner": prediction.get("predicted_winner"),
+        "confidence": prediction.get("confidence"),
+        "base_model_prob": prediction.get("base_model_prob"),
+        "pitcher_adjustment": prediction.get("pitcher_adjustment"),
+        "standings_adjustment": prediction.get("standings_adjustment"),
+        "data_quality": prediction.get("data_quality"),
+        "home_pitcher": prediction.get("home_pitcher"),
+        "away_pitcher": prediction.get("away_pitcher"),
+        "home_pitcher_stats": prediction.get("home_pitcher_stats"),
+        "away_pitcher_stats": prediction.get("away_pitcher_stats"),
+        "run_expectancy": prediction.get("run_expectancy"),
+        "standings_context": prediction.get("standings_context"),
+    }
+    return (
+        "/no_think\n"
+        "너는 KBO 야구 승부예측 모델의 설명가능한 AI 해설자다.\n"
+        "아래 JSON을 근거로, 한국어로 5~7문장만 작성해라.\n"
+        "추론 과정, <think> 블록, 내부 사고 과정은 절대 출력하지 마라.\n"
+        "과장하지 말고, 기본 모델 확률, 선발투수 보정, 순위/최근성적 보정, 데이터 품질 한계를 설명해라.\n"
+        "도박 권유 표현은 쓰지 말고 참고용 예측이라고 밝혀라.\n"
+        "마지막 문장은 반드시 완결된 문장으로 끝내라.\n\n"
+        f"예측 JSON:\n{json.dumps(compact, ensure_ascii=False, indent=2)}"
+    )
+
+
+def clean_llm_explanation(text: str) -> str:
+    text = (text or "").strip()
+    if "</think>" in text:
+        text = text.split("</think>", 1)[1].strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+    text = re.sub(r"^/no_think\s*", "", text, flags=re.IGNORECASE).strip()
+    if text and text[-1] not in ".!?。！？다요음함됨임니다습니다":
+        text = text.rstrip(" ,;:") + "."
+    return text
+
+
+def explain_with_ollama(prediction: dict, model: str | None = None) -> dict:
+    selected_model = choose_ollama_model(model)
+    if not selected_model:
+        return {
+            "source": "fallback",
+            "model": None,
+            "explanation": fallback_prediction_explanation(prediction),
+            "message": "Ollama 모델을 찾지 못해 기본 설명을 사용했습니다.",
+        }
+
+    try:
+        import requests
+        resp = requests.post(
+            f"{_ollama_base_url()}/api/generate",
+            json={
+                "model": selected_model,
+                "prompt": build_llm_prompt(prediction),
+                "stream": False,
+                "options": {
+                    "temperature": 0.15,
+                    "num_predict": 1200,
+                    "num_ctx": 4096,
+                    "repeat_penalty": 1.08,
+                },
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        text = clean_llm_explanation(resp.json().get("response") or "")
+        if not text:
+            raise ValueError("empty ollama response")
+        return {
+            "source": "ollama",
+            "model": selected_model,
+            "explanation": text,
+        }
+    except Exception as e:
+        logger.warning(f"Ollama 설명 생성 실패: {e}")
+        return {
+            "source": "fallback",
+            "model": selected_model,
+            "explanation": fallback_prediction_explanation(prediction),
+            "message": f"Ollama 호출 실패: {e}",
+        }
+
+
+def compute_prediction_performance(limit: int = 400) -> dict:
+    """현재 모델 기준 예측-실제 비교 지표. 운영 모니터링용으로 최근 경기 중심."""
+    if features_df is None or feature_cols is None or ensemble is None or not ensemble._loaded:
+        return {"available": False, "message": "모델 또는 피처 데이터가 로드되지 않았습니다."}
+
+    import pandas as pd
+    from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_score
+
+    df = features_df.dropna(subset=["home_win"]).sort_values("date").tail(limit).copy()
+    if df.empty:
+        return {"available": False, "message": "평가할 완료 경기 데이터가 없습니다."}
+
+    X = df[feature_cols].astype(np.float32).values
+    y = df["home_win"].astype(int).values
+    probs = np.asarray(ensemble.predict_proba(X), dtype=float)
+    preds = (probs >= 0.5).astype(int)
+
+    metrics = {
+        "accuracy": round(float(accuracy_score(y, preds)), 4),
+        "brier": round(float(brier_score_loss(y, probs)), 4),
+        "logloss": round(float(log_loss(y, np.clip(probs, 1e-5, 1 - 1e-5))), 4),
+        "auc": round(float(roc_auc_score(y, probs)), 4) if len(set(y)) > 1 else None,
+        "sample_size": int(len(df)),
+    }
+
+    bins = pd.cut(probs, bins=[0, 0.4, 0.5, 0.6, 1.0], include_lowest=True)
+    calibration = []
+    for interval, group in df.assign(prob=probs, actual=y).groupby(bins, observed=True):
+        calibration.append({
+            "bucket": str(interval),
+            "count": int(len(group)),
+            "avg_prob": round(float(group["prob"].mean()), 4),
+            "actual_rate": round(float(group["actual"].mean()), 4),
+        })
+
+    recent = []
+    for (_, row), prob in zip(df.tail(25).iterrows(), probs[-25:]):
+        actual = row["home_team"] if int(row["home_win"]) == 1 else row["away_team"]
+        predicted = row["home_team"] if prob >= 0.5 else row["away_team"]
+        recent.append({
+            "date": pd.Timestamp(row["date"]).strftime("%Y-%m-%d"),
+            "home_team": row["home_team"],
+            "away_team": row["away_team"],
+            "predicted": predicted,
+            "actual": actual,
+            "home_win_prob": round(float(prob), 4),
+            "correct": predicted == actual,
+        })
+
+    return {
+        "available": True,
+        "metrics": metrics,
+        "calibration": calibration,
+        "recent": list(reversed(recent)),
+        "note": "현재 로드된 모델로 과거 완료 경기를 재평가한 운영 모니터링 지표입니다.",
+    }
+
+
 # ===== API 엔드포인트 =====
 
 @app.get("/api/health")
@@ -414,6 +686,8 @@ async def predict_game(req: PredictRequest):
     home_win_prob = 0.5
     confidence = "낮음"
     prediction_method = "통계 기반"
+    X = None
+    run_expectancy = None
 
     if ensemble and ensemble._loaded:
         X = build_prediction_features(req.home_team, req.away_team, game_date)
@@ -425,6 +699,21 @@ async def predict_game(req: PredictRequest):
             except Exception as e:
                 logger.warning(f"앙상블 예측 실패: {e}")
 
+    if X is not None and run_expectancy_model is not None:
+        try:
+            exp_home, exp_away = run_expectancy_model.predict_scores(X)
+            run_prob = float(run_expectancy_model.predict_home_win_prob(X)[0])
+            run_expectancy = {
+                "home_expected_runs": round(float(exp_home[0]), 2),
+                "away_expected_runs": round(float(exp_away[0]), 2),
+                "home_win_prob": round(run_prob, 4),
+            }
+            if prediction_method == "AI 앙상블":
+                home_win_prob = float(home_win_prob * 0.82 + run_prob * 0.18)
+                prediction_method = "AI 앙상블 + 예상득점"
+        except Exception as e:
+            logger.warning(f"예상 득점 모델 예측 실패: {e}")
+
     # 통계 기반 보정 (모델 없을 시)
     if prediction_method == "통계 기반" and home_stats and away_stats:
         home_wr = home_stats.get("win_rate", 0.5)
@@ -433,6 +722,7 @@ async def predict_game(req: PredictRequest):
         home_win_prob = (home_wr / (home_wr + away_wr) + home_advantage)
         home_win_prob = max(0.1, min(0.9, home_win_prob))
 
+    base_model_prob = home_win_prob
     pitcher_adjustment = 0.0
     home_win_prob, pitcher_adjustment = apply_pitcher_adjustment(
         home_win_prob,
@@ -460,6 +750,14 @@ async def predict_game(req: PredictRequest):
 
     winner = req.home_team if home_win_prob >= 0.5 else req.away_team
     winner_prob = max(home_win_prob, away_win_prob)
+    quality = build_prediction_quality(
+        prediction_method,
+        home_stats,
+        away_stats,
+        req.home_pitcher_stats,
+        req.away_pitcher_stats,
+        standings_context,
+    )
 
     return {
         "home_team": req.home_team,
@@ -480,6 +778,17 @@ async def predict_game(req: PredictRequest):
         "pitcher_adjustment": round(pitcher_adjustment, 4),
         "standings_adjustment": round(standings_adjustment, 4),
         "standings_context": standings_context,
+        "base_model_prob": round(base_model_prob, 4),
+        "total_adjustment": round(pitcher_adjustment + standings_adjustment, 4),
+        "run_expectancy": run_expectancy,
+        "data_quality": quality,
+        "explanation": {
+            "base_model_prob": round(base_model_prob, 4),
+            "run_model_prob": run_expectancy.get("home_win_prob") if run_expectancy else None,
+            "pitcher_adjustment": round(pitcher_adjustment, 4),
+            "standings_adjustment": round(standings_adjustment, 4),
+            "final_home_win_prob": round(home_win_prob, 4),
+        },
     }
 
 
@@ -797,6 +1106,30 @@ async def get_model_info():
         with open(result_path, encoding="utf-8") as f:
             return json.load(f)
     return {"message": "모델 학습 필요"}
+
+
+@app.get("/api/model/performance")
+async def get_model_performance(limit: int = 400):
+    """예측-실제 결과 비교 대시보드 데이터"""
+    return compute_prediction_performance(limit=limit)
+
+
+@app.get("/api/llm/status")
+async def get_llm_status():
+    """로컬 Ollama 상태"""
+    models = get_ollama_models()
+    return {
+        "available": bool(models),
+        "base_url": _ollama_base_url(),
+        "models": models,
+        "selected_model": choose_ollama_model(),
+    }
+
+
+@app.post("/api/explain/prediction")
+async def explain_prediction(req: ExplainRequest):
+    """Ollama 기반 예측 설명 생성"""
+    return explain_with_ollama(req.prediction, req.model)
 
 
 @app.get("/api/predict/matchup")

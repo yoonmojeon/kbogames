@@ -119,6 +119,7 @@ export default function AnalysisPage() {
   const [teamStats, setTeamStats] = useState(null)
   const [recentGames, setRecentGames] = useState([])
   const [modelInfo, setModelInfo] = useState(null)
+  const [modelPerformance, setModelPerformance] = useState(null)
   const [loading, setLoading] = useState(false)
 
   useEffect(() => {
@@ -133,6 +134,7 @@ export default function AnalysisPage() {
     }).catch(() => {}).finally(() => setLoading(false))
 
     axios.get('/api/model/info').then(r => setModelInfo(r.data)).catch(() => {})
+    axios.get('/api/model/performance?limit=500').then(r => setModelPerformance(r.data)).catch(() => {})
   }, [selectedTeam])
 
   // 최근 경기 데이터를 차트용으로 변환
@@ -278,6 +280,59 @@ export default function AnalysisPage() {
           <H2HSection teamA={selectedTeam} teamB={compareTeam} />
 
           {/* 모델 정보 */}
+          {modelPerformance?.available && (
+            <div className="card" style={{ padding: 20 }}>
+              <h3 style={{ fontWeight: 700, fontSize: 15, marginBottom: 16 }}>예측-실제 결과 대시보드</h3>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(130px, 1fr))', gap: 10, marginBottom: 16 }}>
+                <StatBox label="최근 평가 정확도" value={`${((modelPerformance.metrics?.accuracy || 0) * 100).toFixed(1)}`} unit="%" color="#22c55e" />
+                <StatBox label="Brier Score" value={(modelPerformance.metrics?.brier || 0).toFixed(4)} color="#818cf8" />
+                <StatBox label="LogLoss" value={(modelPerformance.metrics?.logloss || 0).toFixed(4)} color="#f59e0b" />
+                <StatBox label="평가 경기 수" value={modelPerformance.metrics?.sample_size?.toLocaleString() || '-'} color="#6366f1" />
+              </div>
+
+              {modelPerformance.calibration?.length > 0 && (
+                <div style={{ marginBottom: 18 }}>
+                  <div style={{ fontSize: 12, color: '#505070', marginBottom: 8 }}>확률 구간별 실제 홈승률</div>
+                  <ResponsiveContainer width="100%" height={190}>
+                    <BarChart data={modelPerformance.calibration}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
+                      <XAxis dataKey="bucket" tick={{ fill: '#505070', fontSize: 10 }} axisLine={false} tickLine={false} />
+                      <YAxis tick={{ fill: '#505070', fontSize: 10 }} axisLine={false} tickLine={false} />
+                      <Tooltip contentStyle={{ background: '#1e1e35', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8 }} />
+                      <Legend wrapperStyle={{ fontSize: 12, color: '#9090b0' }} />
+                      <Bar dataKey="avg_prob" name="평균 예측확률" fill="#818cf8" radius={[4, 4, 0, 0]} />
+                      <Bar dataKey="actual_rate" name="실제 홈승률" fill="#22c55e" radius={[4, 4, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
+
+              {modelPerformance.recent?.length > 0 && (
+                <div>
+                  <div style={{ fontSize: 12, color: '#505070', marginBottom: 8 }}>최근 예측 적중 기록</div>
+                  <div style={{ display: 'grid', gap: 6 }}>
+                    {modelPerformance.recent.slice(0, 8).map((g, i) => (
+                      <div key={`${g.date}-${i}`} style={{
+                        display: 'flex', alignItems: 'center', gap: 10,
+                        padding: '7px 10px', borderRadius: 8,
+                        background: g.correct ? 'rgba(34,197,94,0.07)' : 'rgba(239,68,68,0.07)',
+                        fontSize: 12,
+                      }}>
+                        <span style={{ width: 82, color: '#505070' }}>{g.date}</span>
+                        <span style={{ flex: 1 }}>{g.away_team} @ {g.home_team}</span>
+                        <span style={{ color: '#9090b0' }}>예측 {g.predicted}</span>
+                        <span style={{ color: g.correct ? '#22c55e' : '#ef4444', fontWeight: 700 }}>
+                          {g.correct ? '적중' : `실제 ${g.actual}`}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ marginTop: 10, fontSize: 11, color: '#505070' }}>{modelPerformance.note}</div>
+                </div>
+              )}
+            </div>
+          )}
+
           {modelInfo && modelInfo.metrics && (
             <div className="card" style={{ padding: 20 }}>
               <h3 style={{ fontWeight: 700, fontSize: 15, marginBottom: 16 }}>🤖 AI 모델 성능</h3>
