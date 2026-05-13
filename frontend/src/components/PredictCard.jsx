@@ -31,7 +31,7 @@ function FormDots({ form }) {
   )
 }
 
-function TeamPanel({ team, winProb, recentStats, pitcher, isWinner }) {
+function TeamPanel({ team, winProb, recentStats, pitcher, pitcherStats, isWinner }) {
   const color = TEAM_COLORS[team] || '#6366f1'
   const emoji = TEAM_EMOJI[team] || '⚾'
 
@@ -70,6 +70,11 @@ function TeamPanel({ team, winProb, recentStats, pitcher, isWinner }) {
           <div style={{ fontSize: 11, color: '#505070' }}>
             {pitcher || '선발 미정'}
           </div>
+          {pitcherStats && (
+            <div style={{ fontSize: 11, color: '#9090b0', marginTop: 2 }}>
+              ERA {pitcherStats.era} · WHIP {pitcherStats.whip} · WAR {pitcherStats.war}
+            </div>
+          )}
         </div>
       </div>
 
@@ -128,6 +133,7 @@ export default function PredictCard({ prediction, showDetail = false }) {
     home_pitcher, away_pitcher,
     game_time, prediction_method,
     status, home_score, away_score, actual_winner, date,
+    home_pitcher_stats, away_pitcher_stats, pitcher_adjustment,
   } = prediction
 
   const conf = CONFIDENCE_CONFIG[confidence] || CONFIDENCE_CONFIG['낮음']
@@ -182,6 +188,7 @@ export default function PredictCard({ prediction, showDetail = false }) {
             winProb={away_win_prob}
             recentStats={away_recent_stats}
             pitcher={away_pitcher}
+            pitcherStats={away_pitcher_stats}
             isWinner={predicted_winner === away_team}
           />
 
@@ -205,6 +212,7 @@ export default function PredictCard({ prediction, showDetail = false }) {
             winProb={home_win_prob}
             recentStats={home_recent_stats}
             pitcher={home_pitcher}
+            pitcherStats={home_pitcher_stats}
             isWinner={predicted_winner === home_team}
           />
         </div>
@@ -227,6 +235,17 @@ export default function PredictCard({ prediction, showDetail = false }) {
             확률 {(Math.max(home_win_prob, away_win_prob) * 100).toFixed(1)}%
           </div>
         </div>
+
+        {pitcher_adjustment !== 0 && pitcher_adjustment != null && (
+          <div style={{
+            marginTop: 10, fontSize: 12, color: '#9090b0',
+            padding: '8px 12px', borderRadius: 8,
+            background: 'rgba(255,255,255,0.04)',
+            border: '1px solid rgba(255,255,255,0.06)',
+          }}>
+            선발투수 보정: 홈팀 기준 {(pitcher_adjustment * 100).toFixed(1)}%p
+          </div>
+        )}
 
         {status === 'completed' && home_score != null && away_score != null && (
           <div style={{

@@ -133,6 +133,17 @@ def run_training(
     ensemble.feature_cols = feature_cols
     ensemble._loaded = True
 
+    # 검증 세트로 확률 보정. AUC는 유지하면서 0.5 주변 확률 해석을 안정화한다.
+    try:
+        from ensemble import fit_probability_calibrator, save_probability_calibrator
+        raw_val_probs = ensemble.predict_proba(X_val)
+        calibrator = fit_probability_calibrator(raw_val_probs, y_val)
+        save_probability_calibrator(calibrator)
+        ensemble.calibrator = calibrator
+        logger.info("확률 캘리브레이션 완료")
+    except Exception as e:
+        logger.warning(f"확률 캘리브레이션 실패: {e}")
+
     metrics = ensemble.evaluate(X_test, y_test)
 
     # 피처 중요도 출력

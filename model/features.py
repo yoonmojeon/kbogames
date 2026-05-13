@@ -7,6 +7,7 @@ import logging
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from datetime import timedelta
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -110,9 +111,53 @@ def compute_team_rolling_stats(df: pd.DataFrame, windows: list[int] = ROLLING_WI
         # 마지막 경기로부터 휴식일
         t_df["days_rest"] = t_df["date"].diff().dt.days.fillna(1).clip(0, 10)
 
+        # 불펜 피로도 프록시: 최근 3일 경기 수/실점.
+        # 실제 투구수 데이터가 없을 때, 최근 짧은 간격의 경기와 실점을 피로도 대용값으로 사용한다.
+        games_last_3d = []
+        runs_allowed_last_3d = []
+        high_stress_last_3d = []
+        for i, game in t_df.iterrows():
+            current_date = game["date"]
+            prev = t_df[
+                (t_df.index < i) &
+                (t_df["date"] >= current_date - timedelta(days=3)) &
+                (t_df["date"] < current_date)
+            ]
+            games_last_3d.append(len(prev))
+            runs_allowed_last_3d.append(prev["runs_allowed"].sum() if not prev.empty else 0)
+            high_stress_last_3d.append((prev["runs_allowed"] >= 6).sum() if not prev.empty else 0)
+
+        t_df["games_last_3d"] = games_last_3d
+        t_df["runs_allowed_last_3d"] = runs_allowed_last_3d
+        t_df["high_stress_games_last_3d"] = high_stress_last_3d
+
         team_dfs[team] = t_df
 
     return team_dfs
+
+
+def compute_stadium_run_factors(df: pd.DataFrame) -> dict[tuple[pd.Timestamp, str], float]:
+    """각 경기 이전까지의 구장별 평균 총득점 런팩터."""
+    if "stadium" not in df.columns:
+        return {}
+
+    league_avg_total_runs = (df["home_score"] + df["away_score"]).expanding().mean().shift(1)
+    stadium_history: dict[str, list[float]] = {}
+    factors: dict[tuple[pd.Timestamp, str], float] = {}
+
+    for idx, row in df.sort_values("date").iterrows():
+        stadium = row.get("stadium", "")
+        game_date = row["date"]
+        total_runs = float(row["home_score"] + row["away_score"])
+        league_avg = float(league_avg_total_runs.loc[idx]) if not pd.isna(league_avg_total_runs.loc[idx]) else 9.0
+
+        if stadium:
+            prev = stadium_history.get(stadium, [])
+            stadium_avg = float(np.mean(prev)) if prev else league_avg
+            factors[(game_date, stadium)] = stadium_avg / league_avg if league_avg > 0 else 1.0
+            stadium_history.setdefault(stadium, []).append(total_runs)
+
+    return factors
 
 
 def compute_h2h_stats(df: pd.DataFrame) -> pd.DataFrame:
@@ -172,6 +217,9 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     logger.info("상대 전적 계산 중...")
     df_h2h = compute_h2h_stats(df)
 
+    logger.info("구장 런팩터 계산 중...")
+    stadium_factors = compute_stadium_run_factors(df)
+
     feature_rows = []
 
     for idx, row in df_h2h.iterrows():
@@ -214,6 +262,9 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
         feat["home_home_win_rate_10"] = hs.get("home_win_rate_10", 0.5)
         feat["home_streak"] = hs.get("streak", 0)
         feat["home_days_rest"] = hs.get("days_rest", 1)
+        feat["home_games_last_3d"] = hs.get("games_last_3d", 0)
+        feat["home_runs_allowed_last_3d"] = hs.get("runs_allowed_last_3d", 0)
+        feat["home_high_stress_games_last_3d"] = hs.get("high_stress_games_last_3d", 0)
 
         # 원정팀 피처
         for w in ROLLING_WINDOWS:
@@ -226,6 +277,9 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
         feat["away_away_win_rate_10"] = as_.get("away_win_rate_10", 0.5)
         feat["away_streak"] = as_.get("streak", 0)
         feat["away_days_rest"] = as_.get("days_rest", 1)
+        feat["away_games_last_3d"] = as_.get("games_last_3d", 0)
+        feat["away_runs_allowed_last_3d"] = as_.get("runs_allowed_last_3d", 0)
+        feat["away_high_stress_games_last_3d"] = as_.get("high_stress_games_last_3d", 0)
 
         # 차이 피처
         for w in ROLLING_WINDOWS:
@@ -233,6 +287,11 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
             feat[f"diff_run_diff_{w}"] = feat[f"home_run_diff_{w}"] - feat[f"away_run_diff_{w}"]
 
         feat["diff_season_win_rate"] = feat["home_season_win_rate"] - feat["away_season_win_rate"]
+        feat["diff_days_rest"] = feat["home_days_rest"] - feat["away_days_rest"]
+        feat["diff_games_last_3d"] = feat["home_games_last_3d"] - feat["away_games_last_3d"]
+        feat["diff_bullpen_stress_3d"] = (
+            feat["home_high_stress_games_last_3d"] - feat["away_high_stress_games_last_3d"]
+        )
 
         # 상대 전적
         feat["h2h_home_win_rate"] = row.get("h2h_home_win_rate", 0.5)
@@ -240,6 +299,9 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
 
         # 시즌 내 위치 (0~1)
         feat["season_progress"] = (game_date.timetuple().tm_yday - 60) / 240
+
+        stadium = row.get("stadium", "")
+        feat["stadium_run_factor"] = stadium_factors.get((game_date, stadium), 1.0)
 
         feature_rows.append(feat)
 
@@ -256,7 +318,7 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
 def get_feature_columns(df: pd.DataFrame) -> list[str]:
     """모델 입력 피처 컬럼 목록"""
     exclude = {"date", "home_team", "away_team", "home_win", "season",
-               "home_pitcher", "away_pitcher"}
+               "home_pitcher", "away_pitcher", "stadium", "game_id", "preview_url", "status"}
     return [c for c in df.columns if c not in exclude]
 
 

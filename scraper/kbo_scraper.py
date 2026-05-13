@@ -244,6 +244,15 @@ def _parse_kbo_schedule_html(soup: BeautifulSoup, year: int, respect_cutoff: boo
 
             # 구장 정보 (뒤에서 2번째 컬럼)
             stadium = texts[-2] if len(texts) >= 2 else ""
+            preview_url = ""
+            game_id = ""
+            for link in row.find_all("a"):
+                href = link.get("href", "")
+                if "section=START_PIT" in href or "gameId=" in href:
+                    preview_url = href
+                    match_game_id = re.search(r"gameId=([^&]+)", href)
+                    game_id = match_game_id.group(1) if match_game_id else ""
+                    break
 
             if completed:
                 result = _determine_home_away(team_a, score_a, team_b, score_b, stadium)
@@ -277,6 +286,8 @@ def _parse_kbo_schedule_html(soup: BeautifulSoup, year: int, respect_cutoff: boo
                 "stadium": stadium,
                 "game_time": current_time,
                 "status": "completed" if completed else "scheduled",
+                "game_id": game_id,
+                "preview_url": preview_url,
             })
             break  # 한 행에 하나의 경기만
 

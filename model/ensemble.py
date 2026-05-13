@@ -26,6 +26,7 @@ class KBOEnsemble:
         self.neural_model = None
         self.neural_scaler = None
         self.feature_cols = None
+        self.calibrator = None
         self._loaded = False
 
     def load(self):
@@ -43,6 +44,12 @@ class KBOEnsemble:
             logger.info("신경망 모델 로드 완료")
         except Exception as e:
             logger.warning(f"신경망 로드 실패: {e}")
+
+        try:
+            self.calibrator = load_probability_calibrator()
+            logger.info("확률 캘리브레이터 로드 완료")
+        except Exception:
+            self.calibrator = None
 
         self._loaded = True
         return self
@@ -91,6 +98,12 @@ class KBOEnsemble:
         ensemble_prob = np.zeros(X.shape[0])
         for p, w in zip(probs, weights_norm):
             ensemble_prob += p * w
+
+        if self.calibrator is not None:
+            try:
+                ensemble_prob = self.calibrator.predict_proba(ensemble_prob.reshape(-1, 1))[:, 1]
+            except Exception as e:
+                logger.warning(f"확률 캘리브레이션 실패: {e}")
 
         return ensemble_prob
 
@@ -180,3 +193,21 @@ def load_ensemble_config() -> dict:
     if path.exists():
         return joblib.load(path)
     return {"xgb": 0.4, "lgb": 0.35, "neural": 0.25}
+
+
+def fit_probability_calibrator(raw_probs: np.ndarray, y_val: np.ndarray):
+    """검증 세트로 앙상블 확률을 Platt scaling 보정."""
+    from sklearn.linear_model import LogisticRegression
+
+    calibrator = LogisticRegression(C=1.0, solver="lbfgs")
+    calibrator.fit(raw_probs.reshape(-1, 1), y_val)
+    return calibrator
+
+
+def save_probability_calibrator(calibrator):
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(calibrator, MODEL_DIR / "probability_calibrator.pkl")
+
+
+def load_probability_calibrator():
+    return joblib.load(MODEL_DIR / "probability_calibrator.pkl")

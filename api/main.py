@@ -96,6 +96,8 @@ class PredictRequest(BaseModel):
     game_date: Optional[str] = None
     home_pitcher: Optional[str] = None
     away_pitcher: Optional[str] = None
+    home_pitcher_stats: Optional[dict] = None
+    away_pitcher_stats: Optional[dict] = None
 
 
 class TeamStatsRequest(BaseModel):
@@ -200,6 +202,40 @@ def build_prediction_features(home_team: str, away_team: str,
     return home_row[feature_cols].values.astype(np.float32)
 
 
+def _pitcher_quality_score(stats: dict | None) -> float:
+    if not stats:
+        return 0.0
+
+    era = float(stats.get("era") or 4.5)
+    whip = float(stats.get("whip") or 1.45)
+    war = float(stats.get("war") or 0.0)
+    innings = float(stats.get("starter_avg_innings") or 4.5)
+    qs = float(stats.get("qs") or 0.0)
+    games = max(float(stats.get("games") or 1.0), 1.0)
+
+    # 점수가 높을수록 좋은 선발투수. 대략 -3~+3 범위가 나오도록 압축한다.
+    return (
+        (4.50 - era) * 0.35 +
+        (1.45 - whip) * 1.00 +
+        war * 0.55 +
+        (innings - 4.8) * 0.18 +
+        (qs / games) * 0.45
+    )
+
+
+def apply_pitcher_adjustment(prob: float, home_stats: dict | None, away_stats: dict | None) -> tuple[float, float]:
+    """선발투수 전력 차이를 승률에 보정한다."""
+    if not home_stats or not away_stats:
+        return prob, 0.0
+
+    home_score = _pitcher_quality_score(home_stats)
+    away_score = _pitcher_quality_score(away_stats)
+    diff = home_score - away_score
+    adjustment = float(np.tanh(diff / 2.0) * 0.10)
+    adjusted = max(0.08, min(0.92, prob + adjustment))
+    return adjusted, adjustment
+
+
 # ===== API 엔드포인트 =====
 
 @app.get("/api/health")
@@ -251,6 +287,13 @@ async def predict_game(req: PredictRequest):
         home_win_prob = (home_wr / (home_wr + away_wr) + home_advantage)
         home_win_prob = max(0.1, min(0.9, home_win_prob))
 
+    pitcher_adjustment = 0.0
+    home_win_prob, pitcher_adjustment = apply_pitcher_adjustment(
+        home_win_prob,
+        req.home_pitcher_stats,
+        req.away_pitcher_stats,
+    )
+
     away_win_prob = 1.0 - home_win_prob
 
     diff = abs(home_win_prob - 0.5)
@@ -278,6 +321,9 @@ async def predict_game(req: PredictRequest):
         "away_recent_stats": away_stats,
         "home_pitcher": req.home_pitcher or "미정",
         "away_pitcher": req.away_pitcher or "미정",
+        "home_pitcher_stats": req.home_pitcher_stats,
+        "away_pitcher_stats": req.away_pitcher_stats,
+        "pitcher_adjustment": round(pitcher_adjustment, 4),
     }
 
 
@@ -487,8 +533,8 @@ async def get_games_by_date(game_date: str, refresh: bool = False):
     # 저장 데이터에 없거나 강제 갱신이면 KBO 공식 일정에서 실시간 조회한다.
     if not selected_games:
         try:
-            from scraper.kbo_scraper import scrape_games_by_date
-            selected_games = scrape_games_by_date(game_date)
+            from scraper.pitcher_scraper import scrape_pitcher_matchups_by_date
+            selected_games = scrape_pitcher_matchups_by_date(game_date)
             for game in selected_games:
                 game["source"] = "kbo_live"
         except Exception as e:
@@ -510,6 +556,8 @@ async def get_games_by_date(game_date: str, refresh: bool = False):
                 game_date=game_date,
                 home_pitcher=game.get("home_pitcher"),
                 away_pitcher=game.get("away_pitcher"),
+                home_pitcher_stats=game.get("home_pitcher_stats"),
+                away_pitcher_stats=game.get("away_pitcher_stats"),
             )
             pred = await predict_game(pred_req)
             pred["game_time"] = game.get("game_time", "")
