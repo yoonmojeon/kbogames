@@ -254,8 +254,12 @@ def build_prediction_features(home_team: str, away_team: str,
     if features_df is None or feature_cols is None:
         return None
 
+    import pandas as pd
+
+    query_date = pd.Timestamp(game_date) if game_date else pd.Timestamp(date.today())
+    numeric_defaults = features_df[feature_cols].median(numeric_only=True).to_dict()
+
     if game_date:
-        query_date = game_date
         past = features_df[
             (features_df["date"] < query_date) &
             (
@@ -268,27 +272,114 @@ def build_prediction_features(home_team: str, away_team: str,
             if last.iloc[0]["home_team"] == home_team:
                 return last[feature_cols].values.astype(np.float32)
 
-    # 각 팀의 최근 피처
-    home_recent = features_df[
-        (features_df["home_team"] == home_team) | (features_df["away_team"] == home_team)
-    ].sort_values("date").tail(1)
+    def latest_team_row(team: str):
+        rows = features_df[
+            (features_df["date"] < query_date) &
+            ((features_df["home_team"] == team) | (features_df["away_team"] == team))
+        ].sort_values("date")
+        return None if rows.empty else rows.iloc[-1]
 
-    away_recent = features_df[
-        (features_df["home_team"] == away_team) | (features_df["away_team"] == away_team)
-    ].sort_values("date").tail(1)
+    home_recent = latest_team_row(home_team)
+    away_recent = latest_team_row(away_team)
 
-    if home_recent.empty or away_recent.empty:
+    if home_recent is None or away_recent is None:
         return None
 
-    # 홈팀이 홈인 경우의 최근 피처 사용
-    home_row = features_df[
-        features_df["home_team"] == home_team
-    ].sort_values("date").tail(1)
+    feat = {col: float(numeric_defaults.get(col, 0.0)) for col in feature_cols}
 
-    if home_row.empty:
-        home_row = home_recent
+    def copy_team_features(row, team: str, target_prefix: str):
+        source_prefix = "home" if row["home_team"] == team else "away"
+        suffixes = [
+            "season_win_rate", "streak", "days_rest",
+            "games_last_3d", "runs_allowed_last_3d", "high_stress_games_last_3d",
+            "lineup_ops_proxy", "lineup_obp_proxy", "lineup_power_proxy",
+            "bullpen_pitch_count_proxy_3d",
+            "starter_era_proxy", "starter_whip_proxy",
+            "starter_innings_proxy", "starter_quality_proxy",
+        ]
 
-    return home_row[feature_cols].values.astype(np.float32)
+        for w in (5, 10, 20):
+            suffixes.extend([
+                f"win_rate_{w}",
+                f"runs_scored_{w}",
+                f"runs_allowed_{w}",
+                f"run_diff_{w}",
+            ])
+
+        for suffix in suffixes:
+            src = f"{source_prefix}_{suffix}"
+            dst = f"{target_prefix}_{suffix}"
+            if src in row.index and dst in feat:
+                feat[dst] = float(row[src])
+
+        split_src = f"{source_prefix}_{source_prefix}_win_rate_10"
+        split_dst = f"{target_prefix}_{target_prefix}_win_rate_10"
+        if split_src in row.index and split_dst in feat:
+            feat[split_dst] = float(row[split_src])
+
+        elo_src = f"{source_prefix}_elo"
+        elo_dst = f"{target_prefix}_elo"
+        if elo_src in row.index and elo_dst in feat:
+            feat[elo_dst] = float(row[elo_src])
+
+    copy_team_features(home_recent, home_team, "home")
+    copy_team_features(away_recent, away_team, "away")
+
+    for w in (5, 10, 20):
+        if f"diff_win_rate_{w}" in feat:
+            feat[f"diff_win_rate_{w}"] = feat.get(f"home_win_rate_{w}", 0.5) - feat.get(f"away_win_rate_{w}", 0.5)
+        if f"diff_run_diff_{w}" in feat:
+            feat[f"diff_run_diff_{w}"] = feat.get(f"home_run_diff_{w}", 0.0) - feat.get(f"away_run_diff_{w}", 0.0)
+
+    diff_pairs = {
+        "diff_season_win_rate": ("home_season_win_rate", "away_season_win_rate"),
+        "diff_days_rest": ("home_days_rest", "away_days_rest"),
+        "diff_games_last_3d": ("home_games_last_3d", "away_games_last_3d"),
+        "diff_lineup_ops_proxy": ("home_lineup_ops_proxy", "away_lineup_ops_proxy"),
+        "diff_lineup_obp_proxy": ("home_lineup_obp_proxy", "away_lineup_obp_proxy"),
+        "diff_starter_quality_proxy": ("home_starter_quality_proxy", "away_starter_quality_proxy"),
+        "diff_bullpen_pitch_count_proxy_3d": (
+            "home_bullpen_pitch_count_proxy_3d",
+            "away_bullpen_pitch_count_proxy_3d",
+        ),
+        "diff_elo": ("home_elo", "away_elo"),
+    }
+    for dst, (left, right) in diff_pairs.items():
+        if dst in feat:
+            feat[dst] = feat.get(left, 0.0) - feat.get(right, 0.0)
+
+    if "diff_bullpen_stress_3d" in feat:
+        feat["diff_bullpen_stress_3d"] = (
+            feat.get("home_high_stress_games_last_3d", 0.0) -
+            feat.get("away_high_stress_games_last_3d", 0.0)
+        )
+
+    if "elo_home_win_prob" in feat:
+        diff_elo = feat.get("diff_elo", 0.0)
+        feat["elo_home_win_prob"] = float(1 / (1 + 10 ** (-(diff_elo + 35.0) / 400)))
+
+    if "season_progress" in feat:
+        feat["season_progress"] = float((query_date.timetuple().tm_yday - 60) / 240)
+
+    if games_df is not None:
+        h2h = games_df[
+            (games_df["date"] < query_date) &
+            (
+                ((games_df["home_team"] == home_team) & (games_df["away_team"] == away_team)) |
+                ((games_df["home_team"] == away_team) & (games_df["away_team"] == home_team))
+            ) &
+            (games_df["date"].dt.year == query_date.year)
+        ]
+        if "h2h_games" in feat:
+            feat["h2h_games"] = float(len(h2h))
+        if "h2h_home_win_rate" in feat and not h2h.empty:
+            home_wins = (
+                ((h2h["home_team"] == home_team) & (h2h["home_win"] == 1)).sum() +
+                ((h2h["away_team"] == home_team) & (h2h["home_win"] == 0)).sum()
+            )
+            feat["h2h_home_win_rate"] = float(home_wins / len(h2h))
+
+    return np.array([[feat[col] for col in feature_cols]], dtype=np.float32)
 
 
 def _pitcher_quality_score(stats: dict | None) -> float:
