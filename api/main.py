@@ -4,6 +4,7 @@ KBO 승부예측 FastAPI 서버
 import sys
 import json
 import logging
+import re
 import numpy as np
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -45,6 +46,45 @@ ensemble = None
 feature_cols = None
 features_df = None
 games_df = None
+standings_cache = {"data": [], "updated_at": None}
+
+
+def get_live_standings(force: bool = False) -> list[dict]:
+    """KBO 공식 최신 순위를 가져오고 짧게 캐시한다."""
+    now = datetime.now()
+    cached_at = standings_cache.get("updated_at")
+    if (
+        not force and standings_cache.get("data") and cached_at and
+        (now - cached_at).total_seconds() < 600
+    ):
+        return standings_cache["data"]
+
+    try:
+        from scraper.lineup_scraper import scrape_kbo_official_standings
+        standings = scrape_kbo_official_standings()
+        if standings:
+            standings_cache["data"] = standings
+            standings_cache["updated_at"] = now
+            return standings
+    except Exception as e:
+        logger.warning(f"실시간 순위 수집 실패: {e}")
+
+    # 캐시/파일/로컬 계산 순으로 폴백
+    if standings_cache.get("data"):
+        return standings_cache["data"]
+
+    try:
+        lineup_path = RAW_DIR / "lineup_data.json"
+        if lineup_path.exists():
+            with open(lineup_path, encoding="utf-8") as f:
+                data = json.load(f)
+            standings = data.get("standings", [])
+            if standings:
+                return standings
+    except Exception:
+        pass
+
+    return calculate_standings_from_games()
 
 
 def load_models_and_data():
@@ -159,6 +199,40 @@ def get_team_recent_stats(team: str, before_date: str = None, n: int = 20) -> di
     }
 
 
+def calculate_standings_from_games() -> list[dict]:
+    """로컬 경기 데이터로 2026 시즌 순위를 계산."""
+    if games_df is None:
+        return []
+
+    season_games = games_df[games_df["date"].dt.year == 2026]
+
+    standings = []
+    for team in KBO_TEAMS:
+        home_games = season_games[season_games["home_team"] == team]
+        away_games = season_games[season_games["away_team"] == team]
+
+        wins = (home_games["home_win"] == 1).sum() + (away_games["home_win"] == 0).sum()
+        losses = (home_games["home_win"] == 0).sum() + (away_games["home_win"] == 1).sum()
+        total = wins + losses
+
+        standings.append({
+            "team": team,
+            "wins": int(wins),
+            "losses": int(losses),
+            "draws": 0,
+            "games": int(total),
+            "win_rate": round(wins / total, 3) if total > 0 else 0.0,
+            "source": "local_games",
+        })
+
+    standings.sort(key=lambda x: x["win_rate"], reverse=True)
+    for i, s in enumerate(standings):
+        s["rank"] = i + 1
+        s["gb"] = "0" if i == 0 else "-"
+
+    return standings
+
+
 def build_prediction_features(home_team: str, away_team: str,
                                 game_date: str = None) -> np.ndarray | None:
     """예측용 피처 생성"""
@@ -236,6 +310,78 @@ def apply_pitcher_adjustment(prob: float, home_stats: dict | None, away_stats: d
     return adjusted, adjustment
 
 
+def _parse_recent_10_score(recent: str) -> float:
+    if not recent:
+        return 0.0
+    wins = losses = draws = 0
+    for count, label in re.findall(r"(\d+)(승|패|무)", recent):
+        if label == "승":
+            wins = int(count)
+        elif label == "패":
+            losses = int(count)
+        elif label == "무":
+            draws = int(count)
+    total = wins + losses + draws
+    if total == 0:
+        return 0.0
+    return (wins + draws * 0.5) / total - 0.5
+
+
+def _parse_split_record(record: str) -> float | None:
+    """KBO 표기 '승-무-패'를 승률로 변환."""
+    if not record or "-" not in record:
+        return None
+    try:
+        wins, draws, losses = [int(x) for x in record.split("-")[:3]]
+        total = wins + draws + losses
+        if total == 0:
+            return None
+        return (wins + draws * 0.5) / total
+    except Exception:
+        return None
+
+
+def apply_standings_adjustment(prob: float, home_team: str, away_team: str) -> tuple[float, float, dict]:
+    """최신 순위/최근 10경기/홈원정 기록 기반 보정."""
+    standings = get_live_standings()
+    by_team = {row.get("team"): row for row in standings}
+    home = by_team.get(home_team)
+    away = by_team.get(away_team)
+    if not home or not away:
+        return prob, 0.0, {}
+
+    home_wr = float(home.get("win_rate") or 0.5)
+    away_wr = float(away.get("win_rate") or 0.5)
+    rank_diff = float((away.get("rank") or 5.5) - (home.get("rank") or 5.5))
+    recent_diff = _parse_recent_10_score(home.get("recent_10", "")) - _parse_recent_10_score(away.get("recent_10", ""))
+
+    home_split = _parse_split_record(home.get("home_record", ""))
+    away_split = _parse_split_record(away.get("away_record", ""))
+    split_diff = (home_split - away_split) if home_split is not None and away_split is not None else 0.0
+
+    strength = (
+        (home_wr - away_wr) * 2.5 +
+        rank_diff * 0.025 +
+        recent_diff * 0.35 +
+        split_diff * 0.45
+    )
+    adjustment = float(np.tanh(strength) * 0.055)
+    adjusted = max(0.08, min(0.92, prob + adjustment))
+
+    context = {
+        "home_rank": home.get("rank"),
+        "away_rank": away.get("rank"),
+        "home_win_rate": home_wr,
+        "away_win_rate": away_wr,
+        "home_recent_10": home.get("recent_10", ""),
+        "away_recent_10": away.get("recent_10", ""),
+        "home_home_record": home.get("home_record", ""),
+        "away_away_record": away.get("away_record", ""),
+        "source": home.get("source") or away.get("source") or "",
+    }
+    return adjusted, adjustment, context
+
+
 # ===== API 엔드포인트 =====
 
 @app.get("/api/health")
@@ -294,6 +440,14 @@ async def predict_game(req: PredictRequest):
         req.away_pitcher_stats,
     )
 
+    standings_adjustment = 0.0
+    standings_context = {}
+    home_win_prob, standings_adjustment, standings_context = apply_standings_adjustment(
+        home_win_prob,
+        req.home_team,
+        req.away_team,
+    )
+
     away_win_prob = 1.0 - home_win_prob
 
     diff = abs(home_win_prob - 0.5)
@@ -324,49 +478,26 @@ async def predict_game(req: PredictRequest):
         "home_pitcher_stats": req.home_pitcher_stats,
         "away_pitcher_stats": req.away_pitcher_stats,
         "pitcher_adjustment": round(pitcher_adjustment, 4),
+        "standings_adjustment": round(standings_adjustment, 4),
+        "standings_context": standings_context,
     }
 
 
 @app.get("/api/standings")
-async def get_standings():
+async def get_standings(refresh: bool = True):
     """현재 순위"""
-    try:
-        lineup_path = RAW_DIR / "lineup_data.json"
-        if lineup_path.exists():
-            with open(lineup_path, encoding="utf-8") as f:
-                data = json.load(f)
-            return data.get("standings", [])
-    except Exception:
-        pass
+    return get_live_standings(force=refresh)
 
-    # 경기 데이터로 계산
-    if games_df is None:
-        return []
 
-    season_games = games_df[games_df["date"].dt.year == 2026]
-
-    standings = []
-    for team in KBO_TEAMS:
-        home_games = season_games[season_games["home_team"] == team]
-        away_games = season_games[season_games["away_team"] == team]
-
-        wins = (home_games["home_win"] == 1).sum() + (away_games["home_win"] == 0).sum()
-        losses = (home_games["home_win"] == 0).sum() + (away_games["home_win"] == 1).sum()
-        total = wins + losses
-
-        standings.append({
-            "team": team,
-            "wins": int(wins),
-            "losses": int(losses),
-            "games": int(total),
-            "win_rate": round(wins / total, 3) if total > 0 else 0.0,
-        })
-
-    standings.sort(key=lambda x: x["win_rate"], reverse=True)
-    for i, s in enumerate(standings):
-        s["rank"] = i + 1
-
-    return standings
+@app.post("/api/standings/refresh")
+async def refresh_standings():
+    """KBO 공식 최신 순위를 강제 갱신"""
+    standings = get_live_standings(force=True)
+    return {
+        "standings": standings,
+        "updated_at": standings_cache.get("updated_at").isoformat() if standings_cache.get("updated_at") else None,
+        "total": len(standings),
+    }
 
 
 @app.get("/api/teams")

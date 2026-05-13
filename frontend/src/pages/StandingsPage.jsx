@@ -12,13 +12,22 @@ export default function StandingsPage() {
   const [loading, setLoading] = useState(true)
   const [selectedTeam, setSelectedTeam] = useState(null)
   const [teamStats, setTeamStats] = useState(null)
+  const [updatedAt, setUpdatedAt] = useState(null)
 
   useEffect(() => {
-    axios.get('/api/standings')
+    loadStandings()
+  }, [])
+
+  const loadStandings = (refresh = false) => {
+    setLoading(true)
+    axios.get(`/api/standings${refresh ? '?refresh=true' : ''}`)
       .then(r => setStandings(r.data))
       .catch(() => {})
-      .finally(() => setLoading(false))
-  }, [])
+      .finally(() => {
+        setUpdatedAt(new Date())
+        setLoading(false)
+      })
+  }
 
   const handleTeamClick = async (team) => {
     setSelectedTeam(team)
@@ -37,9 +46,22 @@ export default function StandingsPage() {
 
   return (
     <div>
-      <div style={{ marginBottom: 24 }}>
-        <h1 style={{ fontSize: 24, fontWeight: 800, marginBottom: 4 }}>🏆 팀 순위</h1>
-        <div style={{ color: '#505070', fontSize: 14 }}>2026 KBO 리그 정규시즌 순위</div>
+      <div style={{ marginBottom: 24, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end' }}>
+        <div>
+          <h1 style={{ fontSize: 24, fontWeight: 800, marginBottom: 4 }}>🏆 팀 순위</h1>
+          <div style={{ color: '#505070', fontSize: 14 }}>
+            2026 KBO 리그 정규시즌 순위 · KBO 공식 실시간 반영
+            {updatedAt && <span> · 갱신 {updatedAt.toLocaleTimeString('ko-KR')}</span>}
+          </div>
+        </div>
+        <button
+          className="btn btn-primary"
+          disabled={loading}
+          onClick={() => loadStandings(true)}
+          style={{ fontSize: 13 }}
+        >
+          {loading ? '갱신 중...' : '실시간 순위 갱신'}
+        </button>
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: selectedTeam ? '1fr 340px' : '1fr', gap: 20 }}>

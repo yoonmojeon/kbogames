@@ -215,6 +215,81 @@ def scrape_standings_selenium() -> list[dict]:
     return standings
 
 
+def scrape_kbo_official_standings() -> list[dict]:
+    """KBO 공식 팀 순위 페이지에서 최신 정규시즌 순위를 수집."""
+    url = "https://www.koreabaseball.com/Record/TeamRank/TeamRank.aspx"
+    headers = {
+        **HEADERS,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+    except Exception as e:
+        logger.warning(f"KBO 공식 순위 요청 실패: {e}")
+        return []
+
+    table = None
+    for candidate in soup.find_all("table"):
+        rows = candidate.find_all("tr")
+        if len(rows) < 10:
+            continue
+        header = [cell.get_text(" ", strip=True) for cell in rows[0].find_all(["th", "td"])]
+        if "순위" in header and "팀명" in header and "승률" in header:
+            table = candidate
+            break
+
+    if not table:
+        return []
+
+    def safe_int(value: str) -> int:
+        try:
+            return int(str(value).replace(",", "").strip())
+        except Exception:
+            return 0
+
+    def safe_float(value: str) -> float:
+        try:
+            return float(str(value).replace(",", "").replace("-", "0").strip())
+        except Exception:
+            return 0.0
+
+    standings = []
+    for row in table.find_all("tr")[1:]:
+        cells = [cell.get_text(" ", strip=True) for cell in row.find_all(["th", "td"])]
+        if len(cells) < 8:
+            continue
+
+        team = normalize_team(cells[1])
+        if team not in KBO_TEAMS:
+            continue
+
+        standings.append({
+            "rank": safe_int(cells[0]),
+            "team": team,
+            "games": safe_int(cells[2]),
+            "wins": safe_int(cells[3]),
+            "losses": safe_int(cells[4]),
+            "draws": safe_int(cells[5]),
+            "win_rate": safe_float(cells[6]),
+            "gb": cells[7],
+            "recent_10": cells[8] if len(cells) > 8 else "",
+            "streak": cells[9] if len(cells) > 9 else "",
+            "home_record": cells[10] if len(cells) > 10 else "",
+            "away_record": cells[11] if len(cells) > 11 else "",
+            "source": "kbo_official",
+        })
+
+    standings.sort(key=lambda item: item["rank"])
+    logger.info(f"KBO 공식 최신 순위 수집: {len(standings)}팀")
+    return standings
+
+
 def scrape_standings_from_games() -> list[dict]:
     """수집된 경기 데이터로 순위 계산"""
     games_path = RAW_DIR / "games_raw.csv"
@@ -392,7 +467,9 @@ def get_full_lineup_data() -> dict:
 
     # 순위 (수집된 경기 데이터 우선, 없으면 Selenium)
     logger.info("순위 수집 중...")
-    standings = scrape_standings_from_games()
+    standings = scrape_kbo_official_standings()
+    if not standings:
+        standings = scrape_standings_from_games()
     if not standings:
         standings = scrape_standings_selenium()
 

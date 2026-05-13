@@ -9,6 +9,7 @@ KBO 프로야구 경기 일정, 팀 성적, 1군 로스터를 수집해 경기 �
 - 직접 매치업 선택 예측
 - 팀 순위, 최근 성적, 상대 전적 분석
 - 실시간 1군 로스터 로드
+- KBO 공식 최신 팀 순위 실시간 반영
 - KBO 게임센터 기반 선발투수 전력분석 반영
 - XGBoost, LightGBM, PyTorch 신경망 앙상블 모델
 - 확률 캘리브레이션으로 예측 확률 보정
@@ -72,6 +73,7 @@ start_dev.bat
 - `GET /api/team/{team}/lineup`: 팀별 1군 로스터
 - `POST /api/lineups/refresh`: 실시간 1군 로스터 갱신
 - `GET /api/standings`: 팀 순위
+- `POST /api/standings/refresh`: KBO 공식 최신 순위 강제 갱신
 - `GET /api/h2h/{home_team}/{away_team}`: 상대 전적
 
 ## 모델 구조
@@ -141,6 +143,7 @@ PyTorch MLP     ─┘
 → 앙상블 모델로 기본 홈 승률 예측
 → KBO 게임센터에서 선발투수 스탯 수집
 → 선발투수 전력 차이로 확률 보정
+→ KBO 공식 최신 순위/최근10경기/홈·원정 성적 보정
 → 화면에 최종 승률, 선발투수 스탯, 보정값 표시
 ```
 

@@ -134,6 +134,7 @@ export default function PredictCard({ prediction, showDetail = false }) {
     game_time, prediction_method,
     status, home_score, away_score, actual_winner, date,
     home_pitcher_stats, away_pitcher_stats, pitcher_adjustment,
+    standings_adjustment, standings_context,
   } = prediction
 
   const conf = CONFIDENCE_CONFIG[confidence] || CONFIDENCE_CONFIG['낮음']
@@ -244,6 +245,22 @@ export default function PredictCard({ prediction, showDetail = false }) {
             border: '1px solid rgba(255,255,255,0.06)',
           }}>
             선발투수 보정: 홈팀 기준 {(pitcher_adjustment * 100).toFixed(1)}%p
+          </div>
+        )}
+
+        {standings_adjustment !== 0 && standings_adjustment != null && (
+          <div style={{
+            marginTop: 8, fontSize: 12, color: '#9090b0',
+            padding: '8px 12px', borderRadius: 8,
+            background: 'rgba(255,255,255,0.04)',
+            border: '1px solid rgba(255,255,255,0.06)',
+          }}>
+            최신 순위 보정: 홈팀 기준 {(standings_adjustment * 100).toFixed(1)}%p
+            {standings_context?.home_rank && standings_context?.away_rank && (
+              <span>
+                {' '}· {home_team} {standings_context.home_rank}위 / {away_team} {standings_context.away_rank}위
+              </span>
+            )}
           </div>
         )}
 
