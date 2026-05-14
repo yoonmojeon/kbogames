@@ -199,8 +199,8 @@ def _parse_kbo_schedule_html(soup: BeautifulSoup, year: int, respect_cutoff: boo
         classes = [" ".join(c.get("class", [])) for c in cells]
 
         # 날짜 행 감지 (class="day" 또는 MM.DD 패턴)
-        if "day" in classes[0] or (texts[0] and re.match(r"\d{2}\.\d{2}", texts[0])):
-            m = re.match(r"(\d{2})\.(\d{2})", texts[0])
+        if "day" in classes[0] or (texts[0] and re.match(r"\d{1,2}\.\d{1,2}", texts[0])):
+            m = re.match(r"(\d{1,2})\.(\d{1,2})", texts[0])
             if m:
                 current_date = f"{year}-{m.group(1).zfill(2)}-{m.group(2).zfill(2)}"
             current_time = texts[1] if len(texts) > 1 and re.match(r"\d{1,2}:\d{2}", texts[1]) else ""
@@ -431,7 +431,11 @@ def scrape_with_selenium_batch(year: int, month: int, driver=None, respect_cutof
         # 월 선택
         try:
             month_sel = driver.find_element(By.CSS_SELECTOR, "select[id*='Month'], select[name*='Month']")
-            Select(month_sel).select_by_value(f"{month:02d}")
+            month_val = f"{month:02d}"
+            try:
+                Select(month_sel).select_by_value(month_val)
+            except Exception:
+                Select(month_sel).select_by_value(str(month))
             time.sleep(2)
         except Exception:
             pass
@@ -449,15 +453,84 @@ def scrape_with_selenium_batch(year: int, month: int, driver=None, respect_cutof
     return games
 
 
+def scrape_gamecenter_day_boxes(game_date: str) -> list[dict]:
+    """
+    게임센터 일별 페이지에서 경기 목록 추출 (requests).
+    월간 스케줄 파싱이 비어 있을 때 폴백으로 사용한다.
+    """
+    ymd = game_date.replace("-", "")
+    url = f"https://www.koreabaseball.com/Schedule/GameCenter/Main.aspx?date={ymd}"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+    except Exception as e:
+        logger.warning(f"게임센터 일별 요청 실패({game_date}): {e}")
+        return []
+
+    soup = BeautifulSoup(r.text, "lxml")
+    games: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    for box in soup.find_all(class_=re.compile(r"(game|schedule|match)", re.I)):
+        text = box.get_text(separator=" ", strip=True)
+        teams_found: list[str] = []
+        for team_key, team_val in TEAM_NAME_MAP.items():
+            if team_key in text:
+                if team_val not in teams_found:
+                    teams_found.append(team_val)
+        if len(teams_found) < 2:
+            continue
+
+        preview_url = ""
+        game_id = ""
+        for link in box.find_all("a", href=True):
+            href = link.get("href", "")
+            if "gameId=" in href or "START_PIT" in href:
+                preview_url = href
+                m_gid = re.search(r"gameId=([^&]+)", href)
+                game_id = m_gid.group(1) if m_gid else ""
+                break
+
+        away_team, home_team = teams_found[0], teams_found[1]
+        key = (home_team, away_team)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        games.append({
+            "date": game_date,
+            "away_team": away_team,
+            "home_team": home_team,
+            "home_score": None,
+            "away_score": None,
+            "home_win": None,
+            "home_pitcher": "",
+            "away_pitcher": "",
+            "stadium": "",
+            "game_time": "",
+            "status": "scheduled",
+            "game_id": game_id,
+            "preview_url": preview_url,
+        })
+
+    if games:
+        logger.info(f"게임센터 일별 폴백: {game_date} -> {len(games)}경기")
+    return games
+
+
 def scrape_games_by_date(game_date: str) -> list[dict]:
     """특정 날짜(YYYY-MM-DD)의 KBO 경기 일정/결과를 실시간 조회"""
     dt = datetime.strptime(game_date, "%Y-%m-%d")
     driver = get_selenium_driver()
     if not driver:
-        return []
+        return scrape_gamecenter_day_boxes(game_date)
     try:
         games = scrape_with_selenium_batch(dt.year, dt.month, driver, respect_cutoff=False)
-        return [g for g in games if g.get("date") == game_date]
+        filtered = [g for g in games if g.get("date") == game_date]
+        if filtered:
+            return filtered
+        logger.info(f"월간 스케줄에서 {game_date} 경기 없음, 게임센터 일별 폴백 시도")
+        return scrape_gamecenter_day_boxes(game_date)
     finally:
         try:
             driver.quit()
@@ -561,33 +634,14 @@ def get_today_schedule() -> list[dict]:
 
 def _get_scheduled_games() -> list[dict]:
     """KBO 게임센터에서 오늘 예정 경기"""
-    today = date.today().strftime("%Y%m%d")
-    url = f"https://www.koreabaseball.com/Schedule/GameCenter/Main.aspx?date={today}"
-
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        soup = BeautifulSoup(r.text, "lxml")
-
-        games = []
-        for box in soup.find_all(class_=re.compile(r"(game|schedule|match)", re.I)):
-            text = box.get_text()
-            teams_found = []
-            for team_key, team_val in TEAM_NAME_MAP.items():
-                if team_key in text:
-                    if team_val not in teams_found:
-                        teams_found.append(team_val)
-            if len(teams_found) >= 2:
-                games.append({
-                    "date": date.today().isoformat(),
-                    "away_team": teams_found[0],
-                    "home_team": teams_found[1],
-                    "home_pitcher": "미정",
-                    "away_pitcher": "미정",
-                    "game_time": "",
-                })
-        return games
-    except Exception:
+    today_iso = date.today().isoformat()
+    games = scrape_gamecenter_day_boxes(today_iso)
+    if not games:
         return []
+    for g in games:
+        g.setdefault("home_pitcher", "미정")
+        g.setdefault("away_pitcher", "미정")
+    return games
 
 
 if __name__ == "__main__":
