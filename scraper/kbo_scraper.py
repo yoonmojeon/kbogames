@@ -213,9 +213,14 @@ def _parse_kbo_schedule_html(soup: BeautifulSoup, year: int, respect_cutoff: boo
             continue
 
         # 경기 결과/일정 셀 찾기
-        # 완료: 삼성 3 vs 5 LG / NC5vs13LG
+        # 완료(공백): 삼성 3 vs 5 LG
+        # 완료(압축): NC5vs13LG, 삼성0vs0LG(경기 전 0-0 표기 → 예정으로 처리)
+        # 예정: 롯데 vs 두산
         completed_pattern = re.compile(
             r"^([가-힣A-Z]{2,5})\s*(\d{1,2})\s*vs\s*(\d{1,2})\s*([가-힣A-Z]{2,5})$"
+        )
+        compact_score_pattern = re.compile(
+            r"^([가-힣A-Z]{2,15})(\d{1,3})vs(\d{1,3})([가-힣A-Z]{2,15})$"
         )
         scheduled_pattern = re.compile(
             r"^([가-힣A-Z]{2,5})\s*vs\s*([가-힣A-Z]{2,5})$"
@@ -223,21 +228,35 @@ def _parse_kbo_schedule_html(soup: BeautifulSoup, year: int, respect_cutoff: boo
 
         for i, text in enumerate(texts):
             text = text.replace("\xa0", " ").strip()
-            completed = completed_pattern.match(text)
-            scheduled = scheduled_pattern.match(text)
-            if not completed and not scheduled:
-                continue
+            # 압축 점수형(NC5vs13LG, 삼성0vs0LG)을 공백형 완료 패턴보다 먼저 본다.
+            # 그렇지 않으면 삼성0vs0LG가 완료(0–0)로만 잡혀 무승부 처리로 경기가 통째로 스킵된다.
+            compact_m = compact_score_pattern.match(text)
+            completed_m = None if compact_m else completed_pattern.match(text)
+            scheduled_m = None if (compact_m or completed_m) else scheduled_pattern.match(text)
 
-            if completed:
-                team_a = normalize_team(completed.group(1))
-                score_a = int(completed.group(2))
-                score_b = int(completed.group(3))
-                team_b = normalize_team(completed.group(4))
+            is_completed = bool(completed_m)
+            team_a = team_b = None
+            score_a = score_b = None
+
+            if compact_m:
+                team_a = normalize_team(compact_m.group(1))
+                score_a = int(compact_m.group(2))
+                score_b = int(compact_m.group(3))
+                team_b = normalize_team(compact_m.group(4))
+                if score_a == 0 and score_b == 0:
+                    is_completed = False
+                else:
+                    is_completed = True
+            elif completed_m:
+                team_a = normalize_team(completed_m.group(1))
+                score_a = int(completed_m.group(2))
+                score_b = int(completed_m.group(3))
+                team_b = normalize_team(completed_m.group(4))
+            elif scheduled_m:
+                team_a = normalize_team(scheduled_m.group(1))
+                team_b = normalize_team(scheduled_m.group(2))
             else:
-                team_a = normalize_team(scheduled.group(1))
-                score_a = None
-                score_b = None
-                team_b = normalize_team(scheduled.group(2))
+                continue
 
             if not team_a or not team_b or team_a == team_b:
                 continue
@@ -254,7 +273,7 @@ def _parse_kbo_schedule_html(soup: BeautifulSoup, year: int, respect_cutoff: boo
                     game_id = match_game_id.group(1) if match_game_id else ""
                     break
 
-            if completed:
+            if is_completed:
                 result = _determine_home_away(team_a, score_a, team_b, score_b, stadium)
                 if not result:
                     continue
@@ -285,7 +304,7 @@ def _parse_kbo_schedule_html(soup: BeautifulSoup, year: int, respect_cutoff: boo
                 "away_pitcher": "",
                 "stadium": stadium,
                 "game_time": current_time,
-                "status": "completed" if completed else "scheduled",
+                "status": "completed" if is_completed else "scheduled",
                 "game_id": game_id,
                 "preview_url": preview_url,
             })
